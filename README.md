@@ -1,81 +1,71 @@
 # Myanmar News RSS
 
-This project builds a deduplicated RSS feed from the fixed Google News query `(myanmar|burma) when:1d` (`hl=en-US`, `gl=US`, `ceid=US:en`).
+A stateless, deduplicated English-language feed of Myanmar and Burma headlines from Google News. Subscribe to it in Folo:
 
-V1 uses token Dice for fuzzy matching, with a default adjusted-score threshold of 0.80. `dice` mode applies the Phase 1 fuzzy matching rules; `exact` mode merges exact normalized headlines only. Within each cluster, the representative is chosen by earliest `pubDate`, then GUID.
+**Live RSS feed:** <https://hois.github.io/myanmar-news-rss/feed.xml>
 
-The CLI supports offline input files and production Google News fetching. Both paths strictly validate RSS items and write a deterministic RSS 2.0 feed atomically.
+**Pages site:** <https://hois.github.io/myanmar-news-rss/>
+
+## How it works
+
+```text
+Google News RSS (current when:1d snapshot)
+  → GitHub Actions (scheduled or manual)
+  → Node.js 24: fetch, strict RSS validation, deduplication
+  → GitHub Pages (feed.xml)
+  → Folo
+```
+
+The source is the fixed [Google News query](https://news.google.com/rss/search?hl=en-US&gl=US&q=%28myanmar%7Cburma%29%20when%3A1d&ceid=US%3Aen). Each run processes the items in that current snapshot. V1 keeps no cross-run history, uses no AI API, database, KV, or other persistent state, and does not archive headlines outside the source's `when:1d` window. There is no fixed output limit or silent truncation; every valid input item reaches deduplication.
+
+`dice` is the production mode. It applies token Dice fuzzy matching with a default adjusted-score threshold of 0.80; `exact` merges exact normalized headlines only. Direct CLI runs also default to `dice` when `--mode` is omitted. In each cluster, the representative is the earliest `pubDate`, with GUID as the stable tie-breaker.
+
+Input and output are validated as RSS 2.0. A document must have one channel with title, link, and description; each item requires a title, link, GUID, and valid `pubDate`. Item description and source (including its URL) are optional. Output is deterministic for the same input and mode, ordered by `pubDate` descending and GUID ascending. `lastBuildDate` is derived from the newest selected item `pubDate` in UTC, not the run time. The channel's `ttl` is 15 minutes as a reader hint; it does not set the workflow schedule. Google News item counts vary and are not capped at 100.
 
 ## Local use
 
-Install the pinned dependency and run the offline tests:
+Use Node.js 24 or later. The only runtime dependency is `@rgrove/parse-xml@5.0.0`.
 
 ```sh
 npm ci
 npm test
 ```
 
-Build `feed.xml` from a local RSS file without network access:
+Build a feed from the synthetic local fixture without network access:
 
 ```sh
 node rss.js --input test/fixtures/handmade.xml --output feed.xml --mode dice
 ```
 
-The production fetch uses Node's built-in `globalThis.fetch`, has a 30-second timeout covering both response headers and body reading, and does not retry. It requires HTTP 200, a non-empty RSS 2.0 document, and valid required fields on every item. HTTP errors, timeouts, network errors, HTML or challenge pages, malformed/non-RSS XML, zero-item feeds, and invalid items exit non-zero. A failed generation leaves an existing `feed.xml` intact.
-
-Fetch Google News and write the production feed:
+Fetch the production source and write a feed:
 
 ```sh
 node rss.js --fetch --output feed.xml --mode dice
 ```
 
-Use `--mode exact` to merge exact normalized headlines only. The CLI defaults to `dice` if `--mode` is omitted. `--input <file>` remains the offline mode and cannot be combined with `--fetch`.
+The fetch uses Node's built-in `globalThis.fetch`, times out after 30 seconds, and does not retry. It requires HTTP 200 and a non-empty, valid RSS 2.0 feed. HTTP errors, timeouts, network errors, HTML or challenge pages, malformed XML, empty feeds, and invalid items fail the command. A failed generation leaves an existing output file intact.
 
-After a validated feed is written, the CLI compares its final bytes with the published feed using SHA-256. Configure the current published URL with `PAGES_FEED_URL`, or pass `--published-url <url>` to override the environment value for this run. The comparison has a 10-second timeout and sends no-cache/revalidation request headers. Comparison errors—including an unset URL, HTTP errors, timeouts, and network failures—are non-fatal and report `changed=true`; the reason is included in the machine-readable output. Identical bytes report `changed=false` with `reason=sha256_match`. Output includes stable `key=value` fields such as `changed`, `reason`, `output_sha256`, item counts, candidate pair/cluster counts, and stage timings.
-
-The output channel has a fixed title, the stable Myanmar/Burma Google News search URL, English language, and `ttl` of 15 minutes. The TTL is a feed hint; it does not guarantee that a reader fetches the feed every 15 minutes. `lastBuildDate` is the newest selected item `pubDate`, so rerunning an unchanged input does not add a runtime timestamp. Items are ordered by `pubDate` descending and then GUID ascending. The writer preserves item title, link, GUID and its `isPermaLink` state, `pubDate`, and optional description/source/source URL, with XML escaping and output round-trip validation.
-
-Output replacement is atomic: the completed temporary file is reparsed and validated before it replaces the destination. A failed generation leaves any existing `feed.xml` intact.
+After a valid feed is written, the CLI compares its bytes with the published feed using SHA-256. Set `PAGES_FEED_URL` or pass `--published-url <url>` for a one-run override. Comparison has a 10-second timeout. A matching hash reports `changed=false` and `reason=sha256_match`; a mismatch reports `changed=true`. If comparison is unavailable or fails, it is non-fatal and reports `changed=true`, allowing a valid new feed to publish. The output also reports mode, HTTP status, item and deduplication counts, SHA-256, reason, and stage timings.
 
 ## GitHub Actions and Pages
 
-Phase 4 adds a scheduled GitHub Actions workflow that builds and publishes the feed through the GitHub Pages artifact deployment flow:
+GitHub Pages uses **GitHub Actions** as its source. The workflow runs on `ubuntu-latest` with Node.js 24, installs the lockfile with `npm ci`, and runs `npm test` before fetching Google News. Only the validated `feed.xml` is included in the Pages artifact.
 
-```text
-Public repository
-  → GitHub Actions schedule or workflow_dispatch
-  → ubuntu-latest / Node.js 24 / npm ci / npm test
-  → fetch the fixed Google News URL in rss.js
-  → strict validation, dedupe, and atomic dist/feed.xml write
-  → compare published bytes by SHA-256
-  → upload the Pages artifact only when changed=true
-  → deploy the artifact to GitHub Pages
-  → Folo
-```
+Configure these as repository Actions variables, not secrets:
 
-The schedule is `7,22,37,52 * * * *` in UTC. GitHub's cron scheduler is best-effort: a run can be delayed, queued, or exceptionally missed. This workflow does not promise an update exactly every 15 minutes.
+| Variable | Production value |
+| --- | --- |
+| `DEDUPE_MODE` | `dice` |
+| `PAGES_FEED_URL` | `https://hois.github.io/myanmar-news-rss/feed.xml` |
 
-`workflow_dispatch` provides a `mode` choice whose default is `inherit`:
+The workflow's `workflow_dispatch` mode defaults to `inherit`. It reads `DEDUPE_MODE`; an unset or empty value resolves to `dice`, while an invalid non-empty value fails the build. Selecting `dice` or `exact` on a manual run overrides only that run and does not change the repository variable. Scheduled runs use the repository variable.
 
-- `inherit` reads the `DEDUPE_MODE` repository variable. If it is unset or empty, the run uses `dice`.
-- `dice` and `exact` on a dispatch override that one run only; they do not change the repository variable.
-- The persistent repository variable may be `dice` or `exact`. An unset/empty value resolves to `dice`; any other non-empty value fails the build instead of silently falling back.
-- Scheduled runs always use `DEDUPE_MODE` with the same empty-to-`dice` rule.
+The schedule is `7,22,37,52 * * * *` in UTC, approximately every 15 minutes. GitHub's scheduler is best-effort: runs can be delayed, queued, or missed, so this is not a precise interval or SLA.
 
-The workflow exposes `vars.PAGES_FEED_URL` as `PAGES_FEED_URL` for the Phase 3 published-feed comparison. This variable is intentionally optional and is not configured in Phase 4. Until it is set, Phase 3 reports `changed=true`, so a valid feed can be uploaded and deployed. After Pages is configured, set it to the confirmed feed URL. If the project uses its default project Pages URL, the expected address is `https://hois.github.io/myanmar-news-rss/feed.xml`; this URL is not embedded in `rss.js`.
+After a successful build, `changed=false` with a matching SHA-256 skips artifact upload and deployment. `changed=true` uploads and deploys the validated feed. A published-feed comparison failure is treated as `changed=true`; it does not block a valid new feed. Source-fetch, RSS validation, deduplication, or output-generation failure fails the build, skips upload and deployment, and preserves the last successfully deployed feed. This safeguard does not guarantee Pages availability.
 
-The build runs `npm test` before any production fetch. It then runs the existing production entry point, captures the single exact `changed=true` or `changed=false` output line, and exports it as the build job's `changed` output. A successful `changed=false` comparison logs `unchanged / sha256_match`, skips artifact upload, and leaves deploy skipped. A successful `changed=true` comparison uploads `dist/` through the official Pages artifact action; the generated directory contains only the validated `feed.xml`. No source files, tests, dependencies, lockfiles, logs, or Git metadata are part of the Pages artifact. The action's short default artifact retention is used.
+The workflow uses official actions pinned to full commit SHAs. Build permissions are limited to `contents: read`; the separate deploy job receives `pages: write` and `id-token: write`. A fixed concurrency group cancels an overlapping in-progress run; it cannot undo a deployment that already completed. Build and deploy timeouts are 5 and 12 minutes.
 
-Checkout, setup, dependency install, tests, mode validation, fetch, parse, dedupe, serialization, output validation, and write failures all fail the build, which prevents artifact upload and deployment. A published-feed comparison failure is intentionally non-fatal in Phase 3 and resolves to `changed=true`; if the new feed itself passes validation, it can still deploy.
+Production smoke checks have verified Google News HTTP 200, successful `dice` deployment, the one-run `exact` override and restoration to `dice`, and that an invalid inherited mode fails before fetching or deploying while retaining the last-good feed. Production has not yet naturally produced an unchanged batch; the `changed=false` path is covered by automated tests. Concurrency cancellation is configured but has not been forced in production.
 
-This is a last-good deployment safeguard: a failed build does not create a new deployment from a bad or fallback feed, so the previous successful deployment remains the last deployed version. It does not guarantee that GitHub Pages itself will always be available or free of service failures.
-
-The workflow uses official, full-SHA-pinned actions: `actions/checkout` v7.0.1, `actions/setup-node` v7.0.0, `actions/upload-pages-artifact` v5.0.0, and `actions/deploy-pages` v5.0.1. The build job has only `contents: read`; the separate deploy job receives `pages: write` and `id-token: write`. A fixed concurrency group cancels an overlapping in-progress run; it cannot roll back a deployment that has already completed. Build and deploy timeouts are 5 and 12 minutes.
-
-The design target is a public repository and the standard GitHub-hosted runner. Platform policies may change; this is not a guarantee of permanent free service. V1 does not use a larger runner, keepalive workflow, PAT, `gh-pages` branch, or feed commits.
-
-GitHub may automatically disable scheduled workflows in a public repository after about 60 days without repository activity. A Pages deployment, artifact upload, or the schedule running by itself is not guaranteed to count as repository activity. V1 does not add keepalive activity or automatic commits. Recovery is: **Enable workflow → run and verify `workflow_dispatch` manually.**
-
-**Phase 4 complete does not mean the feed is live.** Phase 5 must still configure the repository's Pages settings, enable Pages, create any needed repository variables, and run the authorized manual dispatch verification. No Pages settings, variables, dispatch, or deployment are performed by this Phase 4 change.
-
-The existing `test/fixtures/handmade.xml` is a synthetic, manually authored test fixture, not a captured Google News feed.
+GitHub may automatically disable scheduled workflows in a public repository after about 60 days without repository activity. A scheduled run or Pages deployment is not guaranteed to prevent this. V1 adds no keepalive or automatic commits. To resume, enable the workflow, manually run `workflow_dispatch`, and verify the result.
