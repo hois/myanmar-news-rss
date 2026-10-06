@@ -284,3 +284,24 @@ test('successful output passes the round-trip RSS parser and item count check', 
   assert.equal(parsed.items.length, 1);
   assert.equal(parsed.items[0].description, 'A & B < C');
 });
+
+test('atomic writer creates a missing parent directory and writes a strictly valid feed', (t) => {
+  const directory = fs.mkdtempSync(path.join(__dirname, '.missing-parent-'));
+  const outputDirectory = path.join(directory, 'dist');
+  const outputPath = path.join(outputDirectory, 'feed.xml');
+  t.after(() => {
+    if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+    if (fs.existsSync(outputDirectory)) fs.rmdirSync(outputDirectory);
+    fs.rmdirSync(directory);
+  });
+
+  const built = buildFeed([{ ...DEFAULT_ITEM, description: 'A & B < C' }], 'dice');
+  assert.equal(fs.existsSync(outputDirectory), false);
+
+  writeFeedAtomic(outputPath, built.xml, built.outputItemCount);
+
+  assert.deepEqual(fs.readdirSync(outputDirectory), ['feed.xml']);
+  const parsed = validateOutput(fs.readFileSync(outputPath, 'utf8'), built.outputItemCount);
+  assert.equal(parsed.items.length, 1);
+  assert.equal(parsed.items[0].description, 'A & B < C');
+});

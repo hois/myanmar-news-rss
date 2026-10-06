@@ -507,6 +507,7 @@ function writeFeedAtomic(outputPath, xml, expectedItemCount) {
   let descriptor;
   let createdTemporary = false;
   try {
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
     descriptor = fs.openSync(temporary, 'wx');
     createdTemporary = true;
     fs.writeFileSync(descriptor, xml, { encoding: 'utf8' });

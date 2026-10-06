@@ -1,0 +1,145 @@
+name: Update Myanmar News RSS
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Dedupe mode for this run; inherit uses the DEDUPE_MODE repository variable.'
+        type: choice
+        required: true
+        default: inherit
+        options:
+          - inherit
+          - dice
+          - exact
+
+concurrency:
+  group: myanmar-news-rss-feed-deployment
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.feed.outputs.changed }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Run tests before production fetch
+        run: npm test
+
+      - name: Resolve dedupe mode
+        id: mode
+        env:
+          DISPATCH_MODE: ${{ inputs.mode || 'inherit' }}
+          REPOSITORY_MODE: ${{ vars.DEDUPE_MODE }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            case "$DISPATCH_MODE" in
+              dice|exact)
+                mode="$DISPATCH_MODE"
+                ;;
+              inherit)
+                if [[ -z "$REPOSITORY_MODE" ]]; then
+                  mode=dice
+                else
+                  mode="$REPOSITORY_MODE"
+                fi
+                ;;
+              *)
+                echo "::error::Invalid workflow_dispatch mode: $DISPATCH_MODE"
+                exit 1
+                ;;
+            esac
+          elif [[ -z "$REPOSITORY_MODE" ]]; then
+            mode=dice
+          else
+            mode="$REPOSITORY_MODE"
+          fi
+
+          case "$mode" in
+            dice|exact) ;;
+            *)
+              echo "::error::Invalid DEDUPE_MODE repository variable: $mode"
+              exit 1
+              ;;
+          esac
+
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+
+      - name: Generate and compare production feed
+        id: feed
+        env:
+          MODE: ${{ steps.mode.outputs.mode }}
+          PAGES_FEED_URL: ${{ vars.PAGES_FEED_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          node rss.js --fetch --output dist/feed.xml --mode "$MODE" | tee "$RUNNER_TEMP/feed-output.log"
+
+          unexpected="$(find dist -mindepth 1 -maxdepth 1 ! -name feed.xml -print -quit)"
+          if [[ -n "$unexpected" || ! -f dist/feed.xml ]]; then
+            echo '::error::Pages artifact directory must contain only feed.xml'
+            exit 1
+          fi
+
+          changed="$(awk '
+            $0 == "changed=true" { count++; value = "true" }
+            $0 == "changed=false" { count++; value = "false" }
+            END {
+              if (count != 1) exit 1
+              print value
+            }
+          ' "$RUNNER_TEMP/feed-output.log")"
+          printf 'changed=%s\n' "$changed" >> "$GITHUB_OUTPUT"
+
+          if [[ "$changed" == "false" ]]; then
+            echo 'unchanged / sha256_match'
+          fi
+
+      - name: Upload validated Pages artifact
+        if: steps.feed.outputs.changed == 'true'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: dist/
+
+  deploy:
+    needs: build
+    if: ${{ needs.build.result == 'success' && needs.build.outputs.changed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy Pages artifact
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+        with:
+          timeout: 600000
