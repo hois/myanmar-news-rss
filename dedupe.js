@@ -32,7 +32,6 @@ function normalizeHeadline(headline) {
   // unify quotes/dashes
   s = s.replace(/[“”„‟«»]/g, '"').replace(/[‘’‚‛]/g, "'");
   s = s.replace(/[–—−‐‑‒]/g, '-');
-  s = s.replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
   // keep letters/digits/spaces; collapse punct to space
   s = s.replace(/[^\p{L}\p{N}\s]/gu, ' ');
   s = s.replace(/\s+/g, ' ').trim();
@@ -71,7 +70,7 @@ function numberOverlap(a, b) {
   return inter / Math.min(a.size, b.size);
 }
 
-/** Parse minimal RSS item fields without deps */
+/** Legacy Phase 1 RSS helper retained for compatibility with its tests. */
 function parseRssItems(xml) {
   const items = [];
   const re = /<item>([\s\S]*?)<\/item>/g;

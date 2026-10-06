@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0">
   <channel>
+    <title>Synthetic Myanmar news fixture</title>
+    <link>https://example.invalid/search</link>
+    <description>Hand-authored RSS fixture for offline tests.</description>
     <item>
       <title>Myanmar relief update &#8212; North region</title>
       <link>https://example.invalid/one</link>
