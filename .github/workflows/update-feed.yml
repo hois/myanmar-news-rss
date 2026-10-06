@@ -2,7 +2,7 @@ name: Update Myanmar News RSS
 
 on:
   schedule:
-    - cron: '7,22,37,52 * * * *' # scheduler registration refresh
+    - cron: '5,20,35,50 * * * *' # scheduler registration refresh
   workflow_dispatch:
     inputs:
       mode:
