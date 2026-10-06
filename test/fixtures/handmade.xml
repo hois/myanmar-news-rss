@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <item>
+      <title>Myanmar relief update &#8212; North region</title>
+      <link>https://example.invalid/one</link>
+      <guid>fixture-1</guid>
+      <pubDate>Mon, 05 Oct 2026 10:00:00 GMT</pubDate>
+      <source>Example News</source>
+    </item>
+    <item>
+      <title><![CDATA[Myanmar relief update — North region]]></title>
+      <link>https://example.invalid/two</link>
+      <guid>fixture-2</guid>
+      <pubDate>Mon, 05 Oct 2026 11:00:00 GMT</pubDate>
+      <source>Example Wire</source>
+    </item>
+  </channel>
+</rss>

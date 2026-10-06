@@ -2,7 +2,7 @@
 /**
  * Stateless Google News RSS title-near-dup clustering PoC (no deps).
  * Strategy: normalize → exact-hash merge → rare-token inverted index candidates
- * → Dice/Jaccard on token sets → optional number/entity boost → greedy clusters.
+ * → token Dice with number/length guards → Union-Find clusters.
  */
 'use strict';
 
@@ -57,14 +57,6 @@ function tokenize(norm) {
   return { tokens: new Set(tokens), numbers: new Set(numbers), entities: new Set(entities), bag: tokens };
 }
 
-function jaccard(a, b) {
-  if (!a.size && !b.size) return 1;
-  let inter = 0;
-  for (const x of a) if (b.has(x)) inter++;
-  const uni = a.size + b.size - inter;
-  return uni ? inter / uni : 0;
-}
-
 function dice(a, b) {
   if (!a.size && !b.size) return 1;
   let inter = 0;
@@ -77,13 +69,6 @@ function numberOverlap(a, b) {
   let inter = 0;
   for (const x of a) if (b.has(x)) inter++;
   return inter / Math.min(a.size, b.size);
-}
-
-function charNgrams(s, n = 3) {
-  const t = s.replace(/\s+/g, '');
-  const g = new Set();
-  for (let i = 0; i <= t.length - n; i++) g.add(t.slice(i, i + n));
-  return g;
 }
 
 /** Parse minimal RSS item fields without deps */
@@ -119,6 +104,17 @@ function decodeXml(s) {
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
+    .replace(/&#(x[0-9a-f]+|[0-9]+);/gi, (entity, value) => {
+      const hexadecimal = value[0].toLowerCase() === 'x';
+      const codePoint = Number.parseInt(hexadecimal ? value.slice(1) : value, hexadecimal ? 16 : 10);
+      const validXmlCharacter =
+        codePoint === 0x9 || codePoint === 0xa || codePoint === 0xd ||
+        (codePoint >= 0x20 && codePoint <= 0xd7ff) ||
+        (codePoint >= 0xe000 && codePoint <= 0xfffd) ||
+        (codePoint >= 0x10000 && codePoint <= 0x10ffff);
+      if (!Number.isInteger(codePoint) || !validXmlCharacter) return entity;
+      return String.fromCodePoint(codePoint);
+    })
     .replace(/&amp;/g, '&');
 }
 
@@ -140,7 +136,7 @@ function prepare(item) {
  * Candidate generation: inverted index on rare tokens (df <= maxDf)
  * plus always pair exact-key matches.
  */
-function buildCandidates(docs, maxDfFraction = 0.35) {
+function buildCandidates(docs, maxDfFraction = 0.35, includeFuzzy = true) {
   const n = docs.length;
   const maxDf = Math.max(2, Math.floor(n * maxDfFraction));
   const df = new Map();
@@ -163,6 +159,8 @@ function buildCandidates(docs, maxDfFraction = 0.35) {
     for (let a = 0; a < idxs.length; a++)
       for (let b = a + 1; b < idxs.length; b++) add(idxs[a], idxs[b]);
   }
+  if (!includeFuzzy) return { pairs, df };
+
   // rare token posting lists
   const postings = new Map();
   docs.forEach((d, i) => {
@@ -179,49 +177,104 @@ function buildCandidates(docs, maxDfFraction = 0.35) {
     for (let a = 0; a < idxs.length; a++)
       for (let b = a + 1; b < idxs.length; b++) add(idxs[a], idxs[b]);
   }
+
+  // Equal non-empty token sets can still be candidates when all their tokens
+  // are too common for the rare-token index. Anchor each bucket to its first
+  // member so this adds O(bucket size) pairs rather than a full pair expansion.
+  const byTokenSignature = new Map();
+  docs.forEach((d, i) => {
+    if (!d.tokens.size) return;
+    const signature = JSON.stringify([...d.tokens].sort());
+    if (!byTokenSignature.has(signature)) byTokenSignature.set(signature, []);
+    byTokenSignature.get(signature).push(i);
+  });
+  for (const idxs of byTokenSignature.values()) {
+    for (let i = 1; i < idxs.length; i++) add(idxs[0], idxs[i]);
+  }
   return { pairs, df };
 }
 
-function scorePair(di, dj, opts) {
-  const jac = jaccard(di.tokens, dj.tokens);
-  const dic = dice(di.tokens, dj.tokens);
-  const ng = jaccard(charNgrams(di.norm, 3), charNgrams(dj.norm, 3));
+function scorePair(di, dj) {
+  const rawDice = dice(di.tokens, dj.tokens);
   const num = numberOverlap(di.numbers, dj.numbers);
-  let score = opts.metric === 'jaccard' ? jac : opts.metric === 'ngram' ? ng : dic;
+  let adjustedScore = rawDice;
   // number disagreement penalty: both have numbers but no overlap
-  if (num === 0) score *= 0.55;
-  else if (num != null && num >= 1) score = Math.min(1, score + 0.08);
+  if (num === 0) adjustedScore *= 0.55;
+  else if (num != null && num >= 1) adjustedScore = Math.min(1, adjustedScore + 0.08);
   // length ratio: if one title much longer with many extra tokens → likely follow-up
   const lenRatio = Math.min(di.tokens.size, dj.tokens.size) / Math.max(di.tokens.size, dj.tokens.size, 1);
-  if (lenRatio < 0.55 && score < 0.92) score *= 0.75;
+  if (lenRatio < 0.55 && adjustedScore < 0.92) adjustedScore *= 0.75;
   // containment: smaller almost subset of larger — wire rewrite often high containment
   let inter = 0;
   for (const t of di.tokens) if (dj.tokens.has(t)) inter++;
   const contain = inter / Math.min(di.tokens.size, dj.tokens.size || 1);
-  return { score, jac, dic, ng, num, contain, lenRatio };
+  return { rawDice, adjustedScore, num, contain, lenRatio };
 }
 
-function cluster(docs, opts) {
-  const { pairs } = buildCandidates(docs);
+function validateMode(mode) {
+  if (mode !== 'dice' && mode !== 'exact') {
+    throw new Error(`Invalid mode "${mode}"; expected "dice" or "exact"`);
+  }
+  return mode;
+}
+
+function isStrictSubset(a, b) {
+  if (a.size >= b.size) return false;
+  for (const token of a) if (!b.has(token)) return false;
+  return true;
+}
+
+function cluster(docs, opts = {}) {
+  const mode = validateMode(opts.mode === undefined ? 'dice' : opts.mode);
+  const threshold = opts.threshold === undefined ? 0.8 : opts.threshold;
+  const { pairs } = buildCandidates(docs, 0.35, mode === 'dice');
   const edges = [];
+  const diagnostics = opts.debug ? [] : undefined;
+  const reasonCounts = {};
+  let scoredPairs = 0;
+  let mergedPairs = 0;
+  let rejectedPairs = 0;
+  const recordPair = (diagnostic) => {
+    reasonCounts[diagnostic.reason] = (reasonCounts[diagnostic.reason] || 0) + 1;
+    if (diagnostic.decision === 'merge') mergedPairs++;
+    else rejectedPairs++;
+    if (diagnostics) diagnostics.push(diagnostic);
+  };
   for (const key of pairs) {
     const [i, j] = key.split(':').map(Number);
-    const s = scorePair(docs[i], docs[j], opts);
-    if (s.score >= opts.threshold || docs[i].exactKey === docs[j].exactKey) {
-      // exact always merge
-      if (docs[i].exactKey === docs[j].exactKey || s.score >= opts.threshold) {
-        // follow-up guard: high extra unique tokens on one side
-        const onlyI = [...docs[i].tokens].filter((t) => !docs[j].tokens.has(t));
-        const onlyJ = [...docs[j].tokens].filter((t) => !docs[i].tokens.has(t));
-        const asymmetric =
-          Math.min(onlyI.length, onlyJ.length) >= 2 &&
-          Math.max(onlyI.length, onlyJ.length) >= 4 &&
-          s.contain < 0.85 &&
-          docs[i].exactKey !== docs[j].exactKey;
-        if (asymmetric && s.score < 0.9) continue;
-        edges.push({ i, j, ...s });
-      }
+    const di = docs[i], dj = docs[j];
+    if (di.exactKey === dj.exactKey) {
+      edges.push({ i, j, rawDice: 1, adjustedScore: 1, exact: true });
+      recordPair({ i, j, rawDice: 1, adjustedScore: 1, decision: 'merge', reason: 'exact_key' });
+      continue;
     }
+    if (mode === 'exact') continue;
+
+    scoredPairs++;
+    const score = scorePair(di, dj);
+    const strictSubset = isStrictSubset(di.tokens, dj.tokens) || isStrictSubset(dj.tokens, di.tokens);
+    const onlyI = [...di.tokens].filter((t) => !dj.tokens.has(t));
+    const onlyJ = [...dj.tokens].filter((t) => !di.tokens.has(t));
+    const asymmetric =
+      Math.min(onlyI.length, onlyJ.length) >= 2 &&
+      Math.max(onlyI.length, onlyJ.length) >= 4 &&
+      score.contain < 0.85;
+    let reason;
+    if (strictSubset && score.rawDice < 0.85) reason = 'strict_subset_raw_dice_below_0.85';
+    else if (score.adjustedScore < threshold) reason = 'adjusted_score_below_threshold';
+    else if (asymmetric && score.adjustedScore < 0.9) reason = 'asymmetric_follow_up_guard';
+    else reason = 'dice_threshold';
+
+    const merge = reason === 'dice_threshold';
+    recordPair({
+      i,
+      j,
+      rawDice: score.rawDice,
+      adjustedScore: score.adjustedScore,
+      decision: merge ? 'merge' : 'reject',
+      reason,
+    });
+    if (merge) edges.push({ i, j, ...score });
   }
   // Union-Find
   const parent = docs.map((_, i) => i);
@@ -231,16 +284,30 @@ function cluster(docs, opts) {
     b = find(b);
     if (a !== b) parent[b] = a;
   };
-  for (const e of edges) {
-    if (docs[e.i].exactKey === docs[e.j].exactKey || e.score >= opts.threshold) uni(e.i, e.j);
-  }
+  for (const e of edges) uni(e.i, e.j);
   const groups = new Map();
   docs.forEach((_, i) => {
     const r = find(i);
     if (!groups.has(r)) groups.set(r, []);
     groups.get(r).push(i);
   });
-  return { groups: [...groups.values()], edges, candidatePairs: pairs.size };
+  const groupList = [...groups.values()];
+  const stats = {
+    candidatePairs: pairs.size,
+    scoredPairs,
+    mergedPairs,
+    rejectedPairs,
+    clusters: groupList.filter((g) => g.length > 1).length,
+    itemsInClusters: groupList.filter((g) => g.length > 1).reduce((n, g) => n + g.length, 0),
+    uniqueOut: groupList.length,
+    reasonCounts,
+  };
+  return { groups: groupList, edges, candidatePairs: pairs.size, stats, diagnostics };
+}
+
+function compareStrings(a, b) {
+  const left = String(a || ''), right = String(b || '');
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function pickRepresentative(idxs, docs, mode = 'earliest_pub') {
@@ -259,39 +326,44 @@ function pickRepresentative(idxs, docs, mode = 'earliest_pub') {
     return arr[0];
   }
   // earliest_pub (stable GUID preference for Folo)
-  return arr.slice().sort((a, b) => parseDate(a.pubDate) - parseDate(b.pubDate) || a.guid.localeCompare(b.guid))[0];
+  return arr.slice().sort((a, b) =>
+    parseDate(a.pubDate) - parseDate(b.pubDate) ||
+    compareStrings(a.guid, b.guid) ||
+    compareStrings(a.title, b.title)
+  )[0];
 }
 
-function runOnItems(rawItems, thresholds, metric) {
+function runOnItems(rawItems, thresholds = [0.8], mode = 'dice', debug = false) {
+  validateMode(mode);
   const docs = rawItems.map(prepare);
   const results = {};
   for (const th of thresholds) {
-    const { groups, candidatePairs } = cluster(docs, { threshold: th, metric });
+    const { groups, stats, diagnostics } = cluster(docs, { threshold: th, mode, debug });
     const multi = groups.filter((g) => g.length > 1).sort((a, b) => b.length - a.length);
     results[th] = {
-      candidatePairs,
-      clusters: multi.length,
-      itemsInClusters: multi.reduce((s, g) => s + g.length, 0),
-      uniqueOut: groups.length,
+      ...stats,
       top: multi.slice(0, 8).map((g) => ({
         n: g.length,
         rep: pickRepresentative(g, docs).title,
         members: g.map((i) => docs[i].title),
       })),
+      ...(debug ? { diagnostics } : {}),
     };
   }
   return { docs, results };
 }
 
 function parseArgs(argv) {
-  const o = { files: [], thresholds: [0.55, 0.65, 0.72, 0.8, 0.9], metric: 'dice', handmade: false };
+  const o = { files: [], thresholds: [0.8], mode: process.env.DEDUPE_MODE || 'dice', handmade: false, debug: false };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '--metric') o.metric = argv[++i];
+    if (a === '--mode') o.mode = argv[++i];
     else if (a === '--thresholds') o.thresholds = argv[++i].split(',').map(Number);
     else if (a === '--handmade') o.handmade = true;
+    else if (a === '--debug') o.debug = true;
     else o.files.push(a);
   }
+  validateMode(o.mode);
   return o;
 }
 
@@ -312,20 +384,56 @@ const HANDMADE = [
 
 function main() {
   const opts = parseArgs(process.argv);
+  const report = (source, rawItems) => {
+    const started = process.hrtime.bigint();
+    const { results } = runOnItems(rawItems, opts.thresholds, opts.mode, opts.debug);
+    const cpuMsApprox = Number(process.hrtime.bigint() - started) / 1e6;
+    const summary = Object.fromEntries(Object.entries(results).map(([threshold, result]) => [threshold, {
+      candidatePairs: result.candidatePairs,
+      scoredPairs: result.scoredPairs,
+      mergedPairs: result.mergedPairs,
+      rejectedPairs: result.rejectedPairs,
+      clusters: result.clusters,
+      itemsInClusters: result.itemsInClusters,
+      uniqueOut: result.uniqueOut,
+    }]));
+    console.log(JSON.stringify({ source, mode: opts.mode, items: rawItems.length, cpuMsApprox: +cpuMsApprox.toFixed(2), results: summary }));
+    if (opts.debug) {
+      for (const [threshold, result] of Object.entries(results)) {
+        console.error(JSON.stringify({ type: 'dedupe-debug', threshold, stats: summary[threshold], reasonCounts: result.reasonCounts, pairs: result.diagnostics }));
+      }
+    }
+  };
   if (opts.handmade) {
-    const { results } = runOnItems(HANDMADE, opts.thresholds, opts.metric);
-    console.log(JSON.stringify({ source: 'handmade', metric: opts.metric, results }, null, 2));
+    report('handmade', HANDMADE);
   }
   for (const file of opts.files) {
     const xml = fs.readFileSync(file, 'utf8');
     const items = parseRssItems(xml);
-    const t0 = process.hrtime.bigint();
-    const { results } = runOnItems(items, opts.thresholds, opts.metric);
-    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
-    console.log(JSON.stringify({ source: file, items: items.length, metric: opts.metric, cpuMsApprox: +ms.toFixed(2), results }, null, 2));
+    report(file, items);
   }
 }
 
-module.exports = { parseRssItems, prepare, cluster, pickRepresentative, runOnItems, HANDMADE, normalizeHeadline, stripPublisher };
+module.exports = {
+  buildCandidates,
+  cluster,
+  decodeXml,
+  HANDMADE,
+  normalizeHeadline,
+  parseRssItems,
+  pickRepresentative,
+  prepare,
+  runOnItems,
+  scorePair,
+  stripPublisher,
+  validateMode,
+};
 
-if (require.main === module) main();
+if (require.main === module) {
+  try {
+    main();
+  } catch (error) {
+    console.error(error.message);
+    process.exitCode = 1;
+  }
+}
