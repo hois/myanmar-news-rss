@@ -4,12 +4,17 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { performance } = require('node:perf_hooks');
 const { parseXml } = require('@rgrove/parse-xml');
 const { cluster, pickRepresentative, prepare, validateMode } = require('./dedupe');
 
+const GOOGLE_NEWS_URL = 'https://news.google.com/rss/search?hl=en-US&gl=US&q=%28myanmar%7Cburma%29%20when%3A1d&ceid=US%3Aen';
+const SOURCE_TIMEOUT_MS = 30_000;
+const PUBLISHED_TIMEOUT_MS = 10_000;
+
 const CHANNEL = Object.freeze({
   title: 'Myanmar News (Deduplicated)',
-  link: 'https://news.google.com/rss/search?q=Myanmar+OR+Burma&hl=en-US&gl=US&ceid=US:en',
+  link: GOOGLE_NEWS_URL,
   description: 'Deduplicated Google News RSS feed for Myanmar and Burma news.',
   language: 'en',
   ttl: '15',
@@ -274,7 +279,8 @@ function buildFeed(rawItems, mode = 'dice') {
   }
   const items = rawItems.map(validateItem);
   const docs = items.map(prepare);
-  const { groups } = cluster(docs, { mode, threshold: 0.8 });
+  const clustering = cluster(docs, { mode, threshold: 0.8 });
+  const { groups } = clustering;
   const representatives = groups.map((group) => pickRepresentative(group, docs));
   const seenGuids = new Set();
   for (const item of representatives) {
@@ -308,8 +314,190 @@ function buildFeed(rawItems, mode = 'dice') {
     xml,
     inputItemCount: rawItems.length,
     outputItemCount: representatives.length,
+    candidatePairCount: clustering.candidatePairs,
+    clusterCount: groups.length,
     mode,
     sha256: crypto.createHash('sha256').update(xml, 'utf8').digest('hex'),
+  };
+}
+
+function codedError(code, message, cause) {
+  const error = new Error(message, cause === undefined ? undefined : { cause });
+  error.code = code;
+  return error;
+}
+
+function safeErrorMessage(value) {
+  return String(value || 'Unknown error').replace(/[\r\n\t]+/g, ' ').slice(0, 240);
+}
+
+function looksLikeHtml(body) {
+  const sample = body.slice(0, 16_384).replace(/^\uFEFF/, '').trimStart();
+  return /^(?:<!doctype\s+html\b|<html\b|<head\b|<body\b)/i.test(sample) ||
+    /<html\b/i.test(sample.slice(0, 2_048));
+}
+
+function looksLikeRss(body) {
+  return /<rss(?:\s|>)/i.test(body.slice(0, 8_192).replace(/^\uFEFF/, ''));
+}
+
+function challengeLike(body) {
+  return /captcha|unusual traffic|consent\.google|before you continue to google|verify (?:that )?you are human|automated quer(?:y|ies)|challenge-platform/i.test(body.slice(0, 65_536));
+}
+
+async function fetchHttpBytes(url, { timeoutMs, fetchImpl = globalThis.fetch, purpose }) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let response;
+  try {
+    response = await fetchImpl(url, {
+      signal: controller.signal,
+      headers: purpose === 'published'
+        ? {
+            accept: 'application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.1',
+            'cache-control': 'no-cache, max-age=0',
+            pragma: 'no-cache',
+          }
+        : { accept: 'application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.1' },
+    });
+  } catch (error) {
+    clearTimeout(timer);
+    if (controller.signal.aborted) {
+      throw codedError(`${purpose}_timeout`, `${purpose} request timed out after ${timeoutMs} ms`, error);
+    }
+    throw codedError(`${purpose}_network_error`, `${purpose} request failed`, error);
+  }
+
+  const contentType = response.headers.get('content-type') || '';
+  if (response.status !== 200) {
+    clearTimeout(timer);
+    throw codedError(`${purpose}_http_${response.status}`, `${purpose} returned HTTP ${response.status}`);
+  }
+
+  try {
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (controller.signal.aborted) {
+      throw codedError(`${purpose}_timeout`, `${purpose} response body timed out after ${timeoutMs} ms`);
+    }
+    return { bytes, contentType, status: response.status };
+  } catch (error) {
+    if (typeof error.code === 'string' && error.code.startsWith(`${purpose}_`)) throw error;
+    if (controller.signal.aborted) {
+      throw codedError(`${purpose}_timeout`, `${purpose} response body timed out after ${timeoutMs} ms`, error);
+    }
+    throw codedError(`${purpose}_read_error`, `${purpose} response body could not be read`, error);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchSourceRss(url, { fetchImpl = globalThis.fetch, timeoutMs = SOURCE_TIMEOUT_MS } = {}) {
+  let parsedResponse;
+  try {
+    parsedResponse = await fetchHttpBytes(url, { timeoutMs, fetchImpl, purpose: 'source' });
+  } catch (error) {
+    throw error;
+  }
+  const { bytes, contentType, status } = parsedResponse;
+  if (bytes.length === 0 || bytes.toString('utf8').trim() === '') {
+    throw codedError('source_empty_body', 'Google News returned an empty body');
+  }
+  const mediaType = contentType.split(';', 1)[0].trim().toLowerCase();
+  if (mediaType === 'text/html' || looksLikeHtml(bytes.toString('utf8'))) {
+    throw codedError('source_html_response', 'Google News returned an HTML response');
+  }
+  let text;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch (error) {
+    throw codedError('source_invalid_encoding', 'Google News response is not valid UTF-8', error);
+  }
+  if (!looksLikeRss(text) && challengeLike(text)) {
+    throw codedError('source_challenge_response', 'Google News returned a challenge or consent response');
+  }
+  let parsed;
+  try {
+    parsed = parseRss(text);
+  } catch (error) {
+    throw codedError('source_invalid_rss', `Google News RSS validation failed: ${safeErrorMessage(error.message)}`, error);
+  }
+  return { ...parsedResponse, text, parsed, status };
+}
+
+function sha256(bytes) {
+  return crypto.createHash('sha256').update(bytes).digest('hex');
+}
+
+async function comparePublishedFeed(outputBytes, publishedUrl, {
+  fetchImpl = globalThis.fetch,
+  timeoutMs = PUBLISHED_TIMEOUT_MS,
+} = {}) {
+  if (publishedUrl === undefined || publishedUrl === null || String(publishedUrl).trim() === '') {
+    return { changed: true, status: 'unavailable', reason: 'published_url_not_configured' };
+  }
+  let url;
+  try {
+    url = new URL(String(publishedUrl));
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('Unsupported protocol');
+  } catch {
+    return { changed: true, status: 'unavailable', reason: 'published_url_invalid' };
+  }
+
+  try {
+    const published = await fetchHttpBytes(url, { timeoutMs, fetchImpl, purpose: 'published' });
+    const outputHash = sha256(outputBytes);
+    const publishedHash = sha256(published.bytes);
+    if (outputHash === publishedHash) {
+      return { changed: false, status: 'unchanged', reason: 'sha256_match', publishedStatus: published.status };
+    }
+    return { changed: true, status: 'changed', reason: 'sha256_mismatch', publishedStatus: published.status };
+  } catch (error) {
+    return {
+      changed: true,
+      status: 'unavailable',
+      reason: typeof error.code === 'string' && error.code.startsWith('published_')
+        ? error.code
+        : 'published_hash_error',
+    };
+  }
+}
+
+async function runFetchPipeline(outputPath, mode = 'dice', {
+  sourceUrl = GOOGLE_NEWS_URL,
+  publishedUrl,
+  fetchImpl = globalThis.fetch,
+  sourceTimeoutMs = SOURCE_TIMEOUT_MS,
+  compareTimeoutMs = PUBLISHED_TIMEOUT_MS,
+} = {}) {
+  const fetchStart = performance.now();
+  const source = await fetchSourceRss(sourceUrl, { fetchImpl, timeoutMs: sourceTimeoutMs });
+  const fetchDurationMs = performance.now() - fetchStart;
+
+  const dedupeStart = performance.now();
+  const result = buildFeed(source.parsed.items, mode);
+  const dedupeDurationMs = performance.now() - dedupeStart;
+
+  const writeStart = performance.now();
+  writeFeedAtomic(outputPath, result.xml, result.outputItemCount);
+  const outputBytes = fs.readFileSync(path.resolve(outputPath));
+  const outputSha256 = sha256(outputBytes);
+  const writeDurationMs = performance.now() - writeStart;
+
+  const compareStart = performance.now();
+  const comparison = await comparePublishedFeed(outputBytes, publishedUrl, {
+    fetchImpl,
+    timeoutMs: compareTimeoutMs,
+  });
+  const compareDurationMs = performance.now() - compareStart;
+
+  return {
+    ...result,
+    sha256: outputSha256,
+    status: source.status,
+    contentType: source.contentType,
+    bodyBytes: source.bytes.length,
+    comparison,
+    timings: { fetchDurationMs, dedupeDurationMs, writeDurationMs, compareDurationMs },
   };
 }
 
@@ -343,54 +531,150 @@ function parseArgs(argv) {
   const seen = new Set();
   for (let index = 2; index < argv.length; index++) {
     const argument = argv[index];
-    if (!['--input', '--output', '--mode'].includes(argument)) {
+    if (argument === '--fetch') {
+      if (seen.has('fetch')) throw new Error('--fetch may only be specified once');
+      seen.add('fetch');
+      options.fetch = true;
+      continue;
+    }
+    if (!['--input', '--output', '--mode', '--published-url'].includes(argument)) {
       throw new Error(`Unknown argument: ${argument}`);
     }
     const value = argv[++index];
     if (!value || value.startsWith('--')) throw new Error(`${argument} requires a value`);
-    const key = argument.slice(2);
+    const key = argument === '--published-url' ? 'publishedUrl' : argument.slice(2);
     if (seen.has(key)) throw new Error(`${argument} may only be specified once`);
     seen.add(key);
     options[key] = value;
   }
-  if (!options.input) throw new Error('Missing required --input path');
+  if (Boolean(options.input) === Boolean(options.fetch)) {
+    throw new Error('Specify exactly one of --input <file> or --fetch');
+  }
   if (!options.output) throw new Error('Missing required --output path');
+  if (options.publishedUrl && !options.fetch) {
+    throw new Error('--published-url can only be used with --fetch');
+  }
   validateMode(options.mode);
-  if (path.resolve(options.input) === path.resolve(options.output)) {
+  if (options.input && path.resolve(options.input) === path.resolve(options.output)) {
     throw new Error('Input and output paths must be different');
   }
   return options;
 }
 
-function main(argv = process.argv) {
-  const options = parseArgs(argv);
-  const input = fs.readFileSync(options.input, 'utf8');
-  const parsed = parseRss(input);
-  const result = buildFeed(parsed.items, options.mode);
-  writeFeedAtomic(options.output, result.xml, result.outputItemCount);
-  console.log(JSON.stringify({
-    mode: result.mode,
-    inputItems: result.inputItemCount,
-    outputItems: result.outputItemCount,
-    sha256: result.sha256,
-    output: path.resolve(options.output),
-  }));
+function formatLogEntries(entries) {
+  return Object.entries(entries).map(([key, value]) => `${key}=${value}`).join('\n');
+}
+
+function duration(value) {
+  return value.toFixed(1);
+}
+
+async function main(argv = process.argv, {
+  env = process.env,
+  fetchImpl = globalThis.fetch,
+  sourceUrl = GOOGLE_NEWS_URL,
+  sourceTimeoutMs = SOURCE_TIMEOUT_MS,
+  compareTimeoutMs = PUBLISHED_TIMEOUT_MS,
+  stdout = console.log,
+  stderr = console.error,
+} = {}) {
+  let options;
+  try {
+    options = parseArgs(argv);
+  } catch (error) {
+    stderr(`error=${safeErrorMessage(error.message)}`);
+    throw error;
+  }
+  if (options.fetch) {
+    let result;
+    try {
+      result = await runFetchPipeline(options.output, options.mode, {
+        sourceUrl,
+        publishedUrl: options.publishedUrl === undefined ? env.PAGES_FEED_URL : options.publishedUrl,
+        fetchImpl,
+        sourceTimeoutMs,
+        compareTimeoutMs,
+      });
+    } catch (error) {
+      const reason = typeof error.code === 'string' ? error.code : 'generation_failed';
+      if (reason.startsWith('source_')) stderr(formatLogEntries({ fetch_status: 'failed', reason }));
+      else stderr(formatLogEntries({ fetch_status: 'success', reason }));
+      stderr(`error=${safeErrorMessage(error.message)}`);
+      throw error;
+    }
+    const comparison = result.comparison;
+    stdout(formatLogEntries({
+      mode: result.mode,
+      fetch_status: 'success',
+      http_status: result.status,
+      content_type: result.contentType.replace(/\s+/g, ''),
+      body_bytes: result.bodyBytes,
+      input_items: result.inputItemCount,
+      candidate_pairs: result.candidatePairCount,
+      clusters: result.clusterCount,
+      output_items: result.outputItemCount,
+      output_sha256: result.sha256,
+      published_compare: comparison.status,
+      changed: String(comparison.changed),
+      reason: comparison.reason,
+      timing_fetch_ms: duration(result.timings.fetchDurationMs),
+      timing_dedupe_ms: duration(result.timings.dedupeDurationMs),
+      timing_write_ms: duration(result.timings.writeDurationMs),
+      timing_compare_ms: duration(result.timings.compareDurationMs),
+    }));
+    return result;
+  }
+
+  try {
+    const readStart = performance.now();
+    const input = fs.readFileSync(options.input, 'utf8');
+    const parsed = parseRss(input);
+    const fetchDurationMs = performance.now() - readStart;
+    const dedupeStart = performance.now();
+    const result = buildFeed(parsed.items, options.mode);
+    const dedupeDurationMs = performance.now() - dedupeStart;
+    const writeStart = performance.now();
+    writeFeedAtomic(options.output, result.xml, result.outputItemCount);
+    const outputSha256 = sha256(fs.readFileSync(path.resolve(options.output)));
+    const writeDurationMs = performance.now() - writeStart;
+    stdout(formatLogEntries({
+      mode: result.mode,
+      fetch_status: 'skipped',
+      input_items: result.inputItemCount,
+      candidate_pairs: result.candidatePairCount,
+      clusters: result.clusterCount,
+      output_items: result.outputItemCount,
+      output_sha256: outputSha256,
+      published_compare: 'skipped',
+      changed: 'not_applicable',
+      reason: 'offline_input_mode',
+      timing_fetch_ms: duration(fetchDurationMs),
+      timing_dedupe_ms: duration(dedupeDurationMs),
+      timing_write_ms: duration(writeDurationMs),
+    }));
+    return result;
+  } catch (error) {
+    stderr(`error=${safeErrorMessage(error.message)}`);
+    throw error;
+  }
 }
 
 module.exports = {
   buildFeed,
+  comparePublishedFeed,
   escapeXml,
+  fetchSourceRss,
+  GOOGLE_NEWS_URL,
+  main,
   parseRss,
   parseArgs,
+  runFetchPipeline,
   validateOutput,
   writeFeedAtomic,
 };
 
 if (require.main === module) {
-  try {
-    main();
-  } catch (error) {
-    console.error(error.message);
+  main().catch(() => {
     process.exitCode = 1;
-  }
+  });
 }
