@@ -7,7 +7,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
-const { buildFeed, parseRss, validateOutput, writeFeedAtomic } = require('../rss');
+const { buildFeed, filterItems, main, parseRss, validateOutput, writeFeedAtomic } = require('../rss');
 
 const DEFAULT_ITEM = {
   title: 'Myanmar relief update - Example News',
@@ -15,6 +15,10 @@ const DEFAULT_ITEM = {
   guid: 'story-1',
   pubDate: 'Mon, 05 Oct 2026 10:00:00 GMT',
 };
+
+function filterItem(id, overrides = {}) {
+  return { ...DEFAULT_ITEM, guid: `filter-${id}`, ...overrides };
+}
 
 function xmlItem(overrides = {}) {
   const fields = { ...DEFAULT_ITEM, ...overrides };
@@ -113,6 +117,176 @@ test('source URL may be absent while source text is retained', () => {
   const item = parseRss(rss(xmlItem({ source: 'Example &amp; Co' }))).items[0];
   assert.equal(item.source, 'Example & Co');
   assert.equal(item.sourceUrl, undefined);
+});
+
+test('source filters drop social, YouTube, and ecommerce publishers without title matching', () => {
+  const input = [
+    filterItem('facebook-name', { source: ' Facebook ' }),
+    filterItem('facebook-subdomain', { sourceUrl: 'https://m.facebook.com/story' }),
+    filterItem('not-facebook', { sourceUrl: 'https://notfacebook.com/story' }),
+    filterItem('x-name', { source: 'X' }),
+    filterItem('twitter-name', { source: 'Twitter' }),
+    filterItem('instagram-name', { source: 'Instagram' }),
+    filterItem('linkedin-name', { source: 'LinkedIn' }),
+    filterItem('title-only', { title: 'Facebook reports an unrelated Myanmar story', source: 'Example News' }),
+    filterItem('youtube-name', { source: 'YouTube' }),
+    filterItem('youtube-domain', { sourceUrl: 'https://www.youtube.com/watch?v=1' }),
+    filterItem('youtube-short', { sourceUrl: 'https://youtu.be/video' }),
+    filterItem('amazon-com', { sourceUrl: 'https://amazon.com/item' }),
+    filterItem('amazon-co-uk', { sourceUrl: 'https://www.amazon.co.uk/item' }),
+    filterItem('mobilitypass', { sourceUrl: 'https://mobilitypass.com/product' }),
+    filterItem('not-amazon', { sourceUrl: 'https://notamazon.com/item' }),
+  ];
+  const result = filterItems(input);
+  assert.deepEqual(result.items.map((item) => item.guid), ['filter-not-facebook', 'filter-title-only', 'filter-not-amazon']);
+  assert.deepEqual(result.stats, {
+    input: 15,
+    retained: 3,
+    excluded: 12,
+    excludedSocial: 6,
+    excludedYoutube: 3,
+    excludedEcommerce: 3,
+    excludedMitvForeign: 0,
+    mitvFilterSkippedNoSection: false,
+  });
+});
+
+test('MITV detection uses source and sourceUrl hostnames, while invalid URLs fail open', () => {
+  const result = filterItems([
+    filterItem('mitv-source', { title: 'Egypt bus crash kills 13', source: 'myanmar international tv' }),
+    filterItem('mitv-root', { title: 'Egypt bus crash kills 13', sourceUrl: 'https://myanmaritv.com/news' }),
+    filterItem('mitv-www', { title: 'Egypt bus crash kills 13', sourceUrl: 'https://www.myanmaritv.com/news' }),
+    filterItem('not-mitv', { title: 'Egypt bus crash kills 13', sourceUrl: 'https://notmyanmaritv.com/news' }),
+    filterItem('bad-url', { title: 'Egypt bus crash kills 13', sourceUrl: 'not a valid URL' }),
+    filterItem('other-source', { title: 'Egypt bus crash kills 13', source: 'Example News' }),
+  ]);
+  assert.deepEqual(result.items.map((item) => item.guid), ['filter-not-mitv', 'filter-bad-url', 'filter-other-source']);
+  assert.equal(result.stats.excludedMitvForeign, 3);
+});
+
+test('MITV publisher suffix is stripped before core-term matching', () => {
+  const result = filterItems([
+    filterItem('mitv-suffix', {
+      title: 'Egypt bus crash kills 13, injures 34 - Myanmar International TV',
+      source: 'Myanmar International TV',
+    }),
+  ]);
+  assert.equal(result.items.length, 0);
+  assert.equal(result.stats.excludedMitvForeign, 1);
+});
+
+test('MITV section prefixes retain the specified column headlines', () => {
+  const titles = [
+    'Culture and Traditions: Efforts to preserve traditional handicrafts',
+    'Work Undertakings: Development works in Manaung Township inspected',
+    'Courtesy Call : Receiving Nippon Foundation Honorary Chairman',
+    'Pyithu Hluttaw:17th day meeting of Third Regular Session',
+    'Irrigation Facilities:Dam safety measures in Ayeyawady Region',
+    'Role of Youth: Ministries jointly organize discussion',
+    'Myanmar / Thailand: President receives Minister of Energy',
+    'Healthcare Sector: World Traditional Medicine Conference in China',
+    'Handover Event : Indian Embassy donates for Space Museum',
+    'Support for Sports: Chinese Embassy supports to Myanmar Sports Federations',
+  ];
+  const result = filterItems(titles.map((title, index) => filterItem(`mitv-section-${index}`, {
+    title,
+    source: 'Myanmar International TV',
+  })));
+  assert.equal(result.items.length, titles.length);
+  assert.equal(result.stats.excludedMitvForeign, 0);
+});
+
+test('MITV core terms retain local stories and foreign headlines are dropped conservatively', () => {
+  const foreign = [
+    'Chinese premier meets Belarusian Prime Minister',
+    "US Secretary of State Rubio arrives in India for 'trade diplomacy'",
+    'Egypt bus crash kills 13, injures 34',
+    'Scientists confirm six dinosaur footprints in Udon Thani',
+    'Japan launches H3 rocket carrying Mars moon sample-return probe',
+    'OpenAI cancels release of newest model due to safety concerns',
+  ];
+  const input = [
+    filterItem('core-nay-pyi-taw', {
+      title: 'Peace Efforts 2-day workshop concluded in Nay Pyi Taw',
+      source: 'Myanmar International TV',
+    }),
+    ...foreign.map((title, index) => filterItem(`foreign-${index}`, {
+      title,
+      source: 'Myanmar International TV',
+    })),
+  ];
+  const result = filterItems(input);
+  assert.deepEqual(result.items.map((item) => item.guid), ['filter-core-nay-pyi-taw']);
+  assert.equal(result.stats.excludedMitvForeign, 6);
+});
+
+test('approved foreign leakage headlines remain accepted without extra allowlists', () => {
+  const titles = [
+    'Dancing the Macarena: Robots strut their stuff at Japan tech expo',
+    "Mbappe: a good year to win Balon d'Or",
+    'WMO: El Nino set to persist through next February',
+  ];
+  const result = filterItems(titles.map((title, index) => filterItem(`leakage-${index}`, {
+    title,
+    source: 'Myanmar International TV',
+  })));
+  assert.equal(result.items.length, titles.length);
+  assert.equal(result.stats.excludedMitvForeign, 0);
+});
+
+test('MITV filtering fails open for batches of ten or more without section prefixes', () => {
+  const mitvItems = Array.from({ length: 10 }, (_, index) => filterItem(`mitv-no-section-${index}`, {
+    title: `Foreign report number ${index} covers unrelated international news`,
+    source: 'Myanmar International TV',
+  }));
+  const result = filterItems([
+    ...mitvItems,
+    filterItem('youtube-still-dropped', { source: 'YouTube' }),
+  ]);
+  assert.equal(result.stats.mitvFilterSkippedNoSection, true);
+  assert.equal(result.stats.excludedMitvForeign, 0);
+  assert.equal(result.stats.excludedYoutube, 1);
+  assert.equal(result.items.length, 10);
+});
+
+test('buildFeed rejects an empty post-filter result and validates before filtering', () => {
+  assert.throws(
+    () => buildFeed([filterItem('only-social', { source: 'Facebook' })], 'exact'),
+    /No RSS items remain after filtering/
+  );
+  assert.throws(
+    () => buildFeed([filterItem('invalid-social', { source: 'Facebook', pubDate: 'not a date' })], 'exact'),
+    /valid date/
+  );
+});
+
+test('offline input mode logs filter statistics', async (t) => {
+  const prefix = `.filter-log-${process.pid}`;
+  const inputPath = path.join(__dirname, `${prefix}.input.xml`);
+  const outputPath = path.join(__dirname, `${prefix}.feed.xml`);
+  const temporaryPath = `${outputPath}.tmp`;
+  const logs = [];
+  t.after(() => {
+    if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+    if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+    if (fs.existsSync(temporaryPath)) fs.unlinkSync(temporaryPath);
+  });
+  fs.writeFileSync(inputPath, rss(
+    xmlItem({ guid: 'social', source: 'Facebook' }),
+    xmlItem({ guid: 'keep', title: 'Independent astronomy discovery', source: 'Example News' }),
+  ));
+  await main(['node', 'rss.js', '--input', inputPath, '--output', outputPath, '--mode', 'exact'], {
+    stdout: (line) => logs.push(line),
+    stderr: (line) => logs.push(line),
+  });
+  assert.match(logs.join('\n'), /input_items=2/);
+  assert.match(logs.join('\n'), /filtered_items=1/);
+  assert.match(logs.join('\n'), /filter_excluded=1/);
+  assert.match(logs.join('\n'), /excluded_social=1/);
+  assert.match(logs.join('\n'), /excluded_youtube=0/);
+  assert.match(logs.join('\n'), /excluded_ecommerce=0/);
+  assert.match(logs.join('\n'), /excluded_mitv_foreign=0/);
+  assert.match(logs.join('\n'), /mitv_filter_skipped_no_section=false/);
 });
 
 test('a non-standard-looking source URL is retained without rejecting the item', () => {

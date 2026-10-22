@@ -210,6 +210,107 @@ function validateItem(item, index) {
   return { ...item, pubTime };
 }
 
+function hostMatches(hostname, domain) {
+  return hostname === domain || hostname.endsWith(`.${domain}`);
+}
+
+function sourceHostname(sourceUrl) {
+  if (typeof sourceUrl !== 'string' || !sourceUrl) return '';
+  try {
+    return new URL(sourceUrl).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+function isAmazonHostname(hostname) {
+  const labels = hostname.split('.');
+  const amazonIndex = labels.indexOf('amazon');
+  const suffix = labels.slice(amazonIndex + 1);
+  return amazonIndex !== -1 && (
+    suffix.length === 1 ||
+    (suffix.length === 2 && /^[a-z]{2}$/.test(suffix[1]))
+  );
+}
+
+function stripMitvHeadlineSuffix(title, source) {
+  let headline = title.trim();
+  const suffixes = [];
+  if (typeof source === 'string' && source.trim()) suffixes.push(source.trim());
+  suffixes.push('Myanmar International TV');
+  for (const suffix of suffixes) {
+    const escaped = suffix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(`\\s+-\\s+${escaped}\\s*$`, 'i');
+    if (pattern.test(headline)) {
+      headline = headline.replace(pattern, '').trim();
+      break;
+    }
+  }
+  return headline;
+}
+
+function hasMitvSectionPrefix(headline) {
+  const match = headline.match(/^\s*([^:]{2,80}?)\s*:\s*(.+)$/);
+  if (!match) return false;
+  const prefixWords = match[1].trim().split(/\s+/).filter(Boolean).length;
+  const suffixWords = match[2].trim().split(/\s+/).filter(Boolean).length;
+  return prefixWords >= 1 && prefixWords <= 7 && suffixWords >= 3;
+}
+
+const MITV_CORE_TERMS = /\b(myanmar|burma|burmese|nay\s?pyi\s?taw|naypyitaw|yangon|mandalay|hluttaw|tatmadaw)\b/i;
+
+function filterItems(items) {
+  const classified = items.map((item) => {
+    const sourceName = typeof item.source === 'string' ? item.source.trim().toLowerCase() : '';
+    const hostname = sourceHostname(item.sourceUrl);
+    const headline = stripMitvHeadlineSuffix(item.title, item.source);
+    return {
+      item,
+      headline,
+      isSocial: ['facebook', 'x', 'twitter', 'instagram', 'linkedin'].includes(sourceName) ||
+        ['facebook.com', 'x.com', 'twitter.com', 'instagram.com', 'linkedin.com']
+          .some((domain) => hostMatches(hostname, domain)),
+      isYoutube: sourceName === 'youtube' || hostMatches(hostname, 'youtube.com') || hostMatches(hostname, 'youtu.be'),
+      isEcommerce: isAmazonHostname(hostname) || hostMatches(hostname, 'mobilitypass.com'),
+      isMitv: sourceName === 'myanmar international tv' || hostMatches(hostname, 'myanmaritv.com'),
+      hasSectionPrefix: hasMitvSectionPrefix(headline),
+    };
+  });
+  const mitvItems = classified.filter((entry) => entry.isMitv);
+  const mitvFilterSkippedNoSection = mitvItems.length >= 10 &&
+    mitvItems.every((entry) => !entry.hasSectionPrefix);
+  const stats = {
+    input: items.length,
+    retained: 0,
+    excluded: 0,
+    excludedSocial: 0,
+    excludedYoutube: 0,
+    excludedEcommerce: 0,
+    excludedMitvForeign: 0,
+    mitvFilterSkippedNoSection,
+  };
+  const retainedItems = [];
+  for (const entry of classified) {
+    if (entry.isSocial) {
+      stats.excludedSocial++;
+    } else if (entry.isYoutube) {
+      stats.excludedYoutube++;
+    } else if (entry.isEcommerce) {
+      stats.excludedEcommerce++;
+    } else if (
+      entry.isMitv && !mitvFilterSkippedNoSection && entry.headline &&
+      !entry.hasSectionPrefix && !MITV_CORE_TERMS.test(entry.headline)
+    ) {
+      stats.excludedMitvForeign++;
+    } else {
+      retainedItems.push(entry.item);
+    }
+  }
+  stats.retained = retainedItems.length;
+  stats.excluded = stats.input - stats.retained;
+  return { items: retainedItems, stats };
+}
+
 function escapeXml(value) {
   return String(value)
     .replace(/&/g, '&amp;')
@@ -277,7 +378,10 @@ function buildFeed(rawItems, mode = 'dice') {
   if (!Array.isArray(rawItems) || rawItems.length === 0) {
     throw new Error('At least one RSS item is required');
   }
-  const items = rawItems.map(validateItem);
+  const validatedItems = rawItems.map(validateItem);
+  const filtered = filterItems(validatedItems);
+  if (filtered.items.length === 0) throw new Error('No RSS items remain after filtering');
+  const items = filtered.items;
   const docs = items.map(prepare);
   const clustering = cluster(docs, { mode, threshold: 0.8 });
   const { groups } = clustering;
@@ -313,6 +417,8 @@ function buildFeed(rawItems, mode = 'dice') {
   return {
     xml,
     inputItemCount: rawItems.length,
+    filteredItemCount: filtered.stats.retained,
+    filterStats: filtered.stats,
     outputItemCount: representatives.length,
     candidatePairCount: clustering.candidatePairs,
     clusterCount: groups.length,
@@ -611,6 +717,13 @@ async function main(argv = process.argv, {
       content_type: result.contentType.replace(/\s+/g, ''),
       body_bytes: result.bodyBytes,
       input_items: result.inputItemCount,
+      filtered_items: result.filteredItemCount,
+      filter_excluded: result.filterStats.excluded,
+      excluded_social: result.filterStats.excludedSocial,
+      excluded_youtube: result.filterStats.excludedYoutube,
+      excluded_ecommerce: result.filterStats.excludedEcommerce,
+      excluded_mitv_foreign: result.filterStats.excludedMitvForeign,
+      mitv_filter_skipped_no_section: result.filterStats.mitvFilterSkippedNoSection,
       candidate_pairs: result.candidatePairCount,
       clusters: result.clusterCount,
       output_items: result.outputItemCount,
@@ -642,6 +755,13 @@ async function main(argv = process.argv, {
       mode: result.mode,
       fetch_status: 'skipped',
       input_items: result.inputItemCount,
+      filtered_items: result.filteredItemCount,
+      filter_excluded: result.filterStats.excluded,
+      excluded_social: result.filterStats.excludedSocial,
+      excluded_youtube: result.filterStats.excludedYoutube,
+      excluded_ecommerce: result.filterStats.excludedEcommerce,
+      excluded_mitv_foreign: result.filterStats.excludedMitvForeign,
+      mitv_filter_skipped_no_section: result.filterStats.mitvFilterSkippedNoSection,
       candidate_pairs: result.candidatePairCount,
       clusters: result.clusterCount,
       output_items: result.outputItemCount,
@@ -664,6 +784,7 @@ module.exports = {
   buildFeed,
   comparePublishedFeed,
   escapeXml,
+  filterItems,
   fetchSourceRss,
   GOOGLE_NEWS_URL,
   main,
